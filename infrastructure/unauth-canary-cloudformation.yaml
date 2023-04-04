@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "This creates a canary test for the unauthenticated journey + alarm + SNS topic for the alarm"
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+
+  # commented out parameters still need their value determining
+  # AWS::Synthetics::Canary cloudofrmation docs:  https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-synthetics-canary.html
+
+  UnauthJourneyCanary:
+    Type: AWS::Synthetics::Canary
+    Properties: 
+      Name: "unauth-canary-"
+      # ArtifactConfig: 
+      #   ArtifactConfig
+      ArtifactS3Location: "s3://canary/eu-west-2/unauth-canary"
+      Code: 
+        Code < insert actual code here >
+      DeleteLambdaResourcesOnCanaryDeletion: true
+      ExecutionRoleArn: String
+      # RunConfig: 
+      #   RunConfig
+      # RuntimeVersion: String
+      Schedule: 
+        Expression: "rate (5 minutes)"
+      StartCanaryAfterCreation: true
+      # SuccessRetentionPeriod: Integer
+      # Tags: 
+      #   - Tag
+      # VisualReference: 
+      #   VisualReference
+      # VPCConfig: 
+      #   VPCConfig
+
+      SaveDeadLetterQueueAlarm:
+        Type: AWS::CloudWatch::Alarm
+        Properties:
+          AlarmName:
+            !Join [
+              "-",
+              [!Ref AWS::StackName, !Ref Environment, SaveDeadLetterQueueAlarm],
+            ]
+          Namespace: "AWS/SQS"
+          MetricName: "ApproximateNumberOfMessagesVisible"
+          Dimensions:
+            - Name: "QueueName"
+              Value: !GetAtt SaveRawEventsDeadLetterQueue.QueueName
+          Statistic: "Sum"
+          Period: 300
+          EvaluationPeriods: 1
+          Threshold: 1
+
+
+  CloudWatch Alert Canary test failure SNS Topic:
+
+    # below has been adapted from di-infra/platform-alerting
+
+    NotificationTopicKey:
+      Type: AWS::KMS::Key
+      Properties:
+        EnableKeyRotation: true
+        KeyPolicy:
+          Version: 2012-10-17
+          Statement:
+            - Sid: "Allow the account to manage the key"
+              Effect: Allow
+              Principal:
+                AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+              Action: "kms:*"
+              Resource: "*"
+            - Sid: "Allow CodeStar Notifications to enqueue encrypted messages"
+              Effect: Allow
+              Resource: "*"
+              Action:
+                - "kms:Decrypt"
+                - "kms:GenerateDataKey"
+              Principal:
+                Service: codestar-notifications.amazonaws.com
+            - Sid: "Allow Cloudwatch alerts access"
+              Effect: Allow
+              Principal:
+                Service: cloudwatch.amazonaws.com
+              Action:
+                - "kms:Encrypt*"
+                - "kms:Decrypt*"
+                - "kms:ReEncrypt*"
+                - "kms:GenerateDataKey*"
+                - "kms:Describe*"
+              Resource:
+                - "*"
+        Tags:
+          - Key: Name
+            Value: !Sub "${AWS::StackName}-NotificationTopicKey"
+          - Key: Product
+            Value: !Ref ProductTagValue
+          - Key: System
+            Value: !Ref SystemTagValue
+          - Key: Environment
+            Value: !Ref Environment
+          - Key: Owner
+            Value: !Ref OwnerTagValue
+          - Key: Source
+            Value: !Ref SourceTagValue
+
+    CanaryTestFailureTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: !Sub "${AWS::StackName}-CanaryTestFailureTopic"
+        KmsMasterKeyId: !Ref NotificationTopicKey
+        Tags:
+          - Key: Product
+            Value: !Ref ProductTagValue
+          - Key: System
+            Value: !Ref SystemTagValue
+          - Key: Environment
+            Value: !Ref Environment
+          - Key: Owner
+            Value: !Ref OwnerTagValue
+          - Key: Source
+            Value: !Ref SourceTagValue
+
+    CanaryTestFailureTopicPolicy:
+      Type: AWS::SNS::TopicPolicy
+      Properties:
+        Topics:
+          - !Ref CanaryTestFailureTopic
+        PolicyDocument:
+          Statement:
+            - Sid: AllowCloudWatchAlarmsToPublishToSNS
+              Action: "sns:Publish"
+              Effect: Allow
+              Resource: !Ref CanaryTestFailureTopic
+              Principal:
+                Service: cloudwatch.amazonaws.com
+
+    UnauthCanaryAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+          AlarmName: !Sub "${AWS::StackName}-unauth-canary-alarm"
+          AlarmDescription: "Trigger alarm if the unauth journey canary has failed more than or equal to 2 times in 15 minutes "
+          ActionsEnabled: true
+          AlarmActions:
+              - !Ref CanaryTestFailureTopic
+          MetricName: Failed
+          Namespace: CloudWatchSynthetics
+          Statistic: Sum
+          Dimensions:
+              - Name: CanaryName
+                Value: unauth-canary
+          Period: 900 #seconds
+          EvaluationPeriods: 1
+          DatapointsToAlarm: 1
+          Threshold: 2
+          ComparisonOperator: GreaterThanOrEqualToThreshold
+          TreatMissingData: breaching
+          
